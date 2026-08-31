@@ -10,3 +10,15 @@ Parâmetros de limpeza:
 - Resolver faixas duplicadas mantendo a faixa com maior popularidade para tentar excluir álbuns de compilações genéricas
 
 ![alt text](./assets/image.png)
+
+Faixas duplicadas removidas: 32793
+duration_ms < 60000: 742 faixas removidas
+tempo == 0: 145 faixas removidas
+speechiness > 0.5: 1117 faixas removidas
+track_genre in blacklisted_genres: 9318 faixas removidas
+popularity <= 10: 8899 faixas removidas
+loudness <= -16: 6762 faixas removidas
+track_name contains noise keyword: 369 faixas removidas
+
+Total de faixas removidas: 20104
+Total restante: 61103
