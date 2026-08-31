@@ -23,7 +23,7 @@ A tabela abaixo resume os resultados obtidos após a aplicação dos filtros:
 - `duration_ms < 60000`: 742 faixas removidas
 - `tempo == 0`: 145 faixas removidas
 - `speechiness > 0.5`: 1117 faixas removidas
-- `track_genre in blacklisted_genres`: 9318 faixas removidas
+- `track_genre in blacklisted_genres`: 8364 faixas removidas
 - `popularity <= 10`: 8899 faixas removidas
 - `loudness <= -16`: 6762 faixas removidas
 - `track_name contains noise keyword`: 369 faixas removidas
@@ -31,7 +31,7 @@ A tabela abaixo resume os resultados obtidos após a aplicação dos filtros:
 ### Totais finais
 
 - Faixas duplicadas removidas: 32793
-- Total de faixas removidas: 53077
+- Total de faixas removidas: 52606
 - Total restante: 61103
 
 ## Observação
