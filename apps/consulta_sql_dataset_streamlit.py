@@ -5,8 +5,8 @@ import pandas as pd
 import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
-CSV_PATH = BASE_DIR / "dataset" / "dataset.csv"
-DB_PATH = BASE_DIR / "spotify_dataset.db"
+CSV_PATH = BASE_DIR.parent / "dataset" / "dataset_cleaned_20260902_094950.csv"
+DB_PATH = BASE_DIR.parent / "spotify_dataset.db"
 
 
 @st.cache_data
