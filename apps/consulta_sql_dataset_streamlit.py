@@ -5,6 +5,8 @@ import zipfile
 import base64
 import json
 import hashlib
+import re
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -50,157 +52,1106 @@ def execute_query(query: str) -> pd.DataFrame:
         return pd.read_sql_query(cleaned, conn)
 
 
-@st.cache_data(show_spinner=False)
+def clean_search_term(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return ""
+    cleaned = text.replace('"', ' ').replace("'", ' ')
+    cleaned = re.sub(r"\(.*?(remaster|live|feat|version|bonus|deluxe|edit).*?\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\[.*?(remaster|live|feat|version|bonus|deluxe|edit).*?\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"-\s*(remaster|live|radio edit|mono|stereo|anniversary).*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned if cleaned else text.strip()
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
 def find_deezer_preview(track_name: str, artists: str) -> dict | None:
-    query = f"{track_name} {artists.split(';')[0]}"
-    response = requests.get(
-        "https://api.deezer.com/search",
-        params={"q": query, "limit": 1},
-        timeout=10,
-    )
-    response.raise_for_status()
-    results = response.json().get("data", [])
-    if not results or not results[0].get("preview"):
+    first_artist = str(artists).split(";")[0].strip()
+    clean_track = clean_search_term(str(track_name))
+    clean_art = clean_search_term(first_artist)
+
+    queries = [
+        f'artist:"{clean_art}" track:"{clean_track}"',
+        f"{clean_track} {clean_art}",
+        f"{track_name} {first_artist}",
+    ]
+
+    for query in queries:
+        try:
+            response = requests.get(
+                "https://api.deezer.com/search",
+                params={"q": query, "limit": 3},
+                timeout=6,
+            )
+            if response.status_code == 200:
+                results = response.json().get("data", [])
+                for match in results:
+                    if match.get("preview"):
+                        album = match.get("album", {})
+                        artist = match.get("artist", {})
+                        return {
+                            "preview_url": match["preview"],
+                            "title": match.get("title", track_name),
+                            "artist": artist.get("name", first_artist),
+                            "cover": album.get("cover_medium") or album.get("cover_small") or "",
+                            "album": album.get("title", ""),
+                            "duration": match.get("duration", 30),
+                            "deezer_id": match.get("id"),
+                            "link": match.get("link", ""),
+                        }
+        except Exception:
+            continue
+    return None
+
+
+def fetch_all_previews(playlist_df: pd.DataFrame, max_tracks: int = 40) -> list[dict]:
+    tracks_to_fetch = playlist_df.head(max_tracks)
+    previews = []
+
+    def fetch_single(item):
+        idx, track = item
+        match = find_deezer_preview(str(track.get("track_name", "")), str(track.get("artists", "")))
+        if match:
+            return {
+                "position": idx,
+                "title": match["title"],
+                "artist": match["artist"],
+                "preview_url": match["preview_url"],
+                "cover": match.get("cover", ""),
+                "album": match.get("album", ""),
+                "duration": match.get("duration", 30),
+                "key_camelot": str(track.get("key_camelot", "")),
+                "tempo": float(track.get("tempo", 0.0)) if pd.notna(track.get("tempo")) else 0.0,
+                "track_genre": str(track.get("track_genre", "")),
+                "estilo_musical": str(track.get("estilo_musical", "")),
+            }
         return None
-    match = results[0]
-    return {
-        "preview_url": match["preview"],
-        "title": match.get("title", track_name),
-        "artist": match.get("artist", {}).get("name", artists),
-    }
+
+    items = list(enumerate(tracks_to_fetch.to_dict(orient="records"), start=1))
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        results = list(executor.map(fetch_single, items))
+
+    for res in results:
+        if res is not None:
+            previews.append(res)
+
+    return previews
 
 
 @st.cache_data(show_spinner=False)
-def download_preview(preview_url: str) -> bytes:
-    response = requests.get(preview_url, timeout=20)
-    response.raise_for_status()
-    return response.content
+def download_preview_bytes(preview_url: str) -> bytes | None:
+    try:
+        response = requests.get(preview_url, timeout=15)
+        if response.status_code == 200:
+            return response.content
+    except Exception:
+        pass
+    return None
 
 
-def cache_preview(preview_url: str, position: int) -> Path:
+def create_previews_zip(previews: list[dict]) -> bytes:
     PREVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    preview_id = hashlib.sha256(preview_url.encode("utf-8")).hexdigest()[:12]
-    destination = PREVIEW_CACHE_DIR / f"preview_{position}_{preview_id}.mp3"
-    if not destination.exists():
-        destination.write_bytes(download_preview(preview_url))
-    return destination
-
-
-def preview_archive(previews: list[dict]) -> bytes:
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for preview in previews:
-            zip_file.writestr(preview["path"].name, preview["data"])
+        for idx, preview in enumerate(previews, start=1):
+            url = preview.get("preview_url")
+            if not url:
+                continue
+            preview_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+            clean_title = "".join(c for c in f"{idx:02d}_{preview.get('artist')}_{preview.get('title')}" if c.isalnum() or c in (" ", "_", "-")).strip()[:50]
+            filename = f"{clean_title}_{preview_id}.mp3"
+            dest = PREVIEW_CACHE_DIR / filename
+            data = None
+            if dest.exists():
+                data = dest.read_bytes()
+            else:
+                data = download_preview_bytes(url)
+                if data:
+                    dest.write_bytes(data)
+            if data:
+                zip_file.writestr(filename, data)
     return archive.getvalue()
 
 
-def render_crossfade_player(previews: list[dict], crossfade_seconds: float) -> None:
-    audio_sources = json.dumps([preview["data_url"] for preview in previews])
-    audio_labels = json.dumps([
-        f"{preview['title']} - {preview['artist']}" for preview in previews
-    ])
-    component = f"""
-        <div style="font-family: sans-serif; max-width: 720px; padding: 12px; border: 1px solid #ddd; border-radius: 8px;">
-            <strong id="track">Preview 1</strong>
-            <input id="progress" type="range" min="0" max="100" value="0" style="width: 100%; margin: 12px 0;">
-            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-                <button id="previous">Anterior</button>
-                <button id="play">Reproduzir</button>
-                <button id="next">Próxima</button>
-                <label>Crossfade: {crossfade_seconds:.1f}s</label>
+def render_crossfade_player(previews: list[dict], default_crossfade: float = 3.0) -> None:
+    if not previews:
+        st.info("Nenhum preview de áudio disponível para reprodução.")
+        return
+
+    previews_json = json.dumps(previews)
+    component_template = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    user-select: none;
+}
+body {
+    background-color: transparent;
+    color: #ffffff;
+    padding: 4px;
+    overflow: hidden;
+}
+.player-card {
+    background: linear-gradient(160deg, #1f1f1f 0%, #121212 100%);
+    border: 1px solid #2e2e2e;
+    border-radius: 12px;
+    padding: 16px 18px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    max-width: 860px;
+    margin: 0 auto;
+}
+.now-playing {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 12px;
+}
+.cover-box {
+    width: 62px;
+    height: 62px;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #252525;
+    flex-shrink: 0;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.cover-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: none;
+}
+.cover-fallback {
+    font-size: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.track-info {
+    flex: 1;
+    min-width: 0;
+}
+.track-top-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 2px;
+}
+.track-pos {
+    font-size: 11px;
+    color: #888888;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.xfade-badge {
+    display: none;
+    background: rgba(29, 185, 84, 0.15);
+    color: #1db954;
+    border: 1px solid #1db954;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 8px;
+    letter-spacing: 0.5px;
+    animation: pulse 1.2s infinite;
+}
+@keyframes pulse {
+    0% { opacity: 0.6; transform: scale(0.98); }
+    50% { opacity: 1; transform: scale(1.02); }
+    100% { opacity: 0.6; transform: scale(0.98); }
+}
+.track-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: #ffffff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.3;
+}
+.track-artist {
+    font-size: 13px;
+    color: #b3b3b3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 1px;
+}
+.track-tags {
+    display: flex;
+    gap: 6px;
+    margin-top: 4px;
+    flex-wrap: wrap;
+}
+.tag {
+    font-size: 10px;
+    background: #252525;
+    color: #1db954;
+    padding: 1px 7px;
+    border-radius: 6px;
+    border: 1px solid #333;
+}
+.progress-container {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+.time-num {
+    font-size: 11px;
+    color: #a0a0a0;
+    min-width: 32px;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+}
+.progress-slider {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: 2px;
+    background: #383838;
+    outline: none;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.progress-slider:hover {
+    background: #4a4a4a;
+}
+.progress-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #1db954;
+    cursor: pointer;
+    box-shadow: 0 0 5px rgba(0,0,0,0.6);
+}
+.controls-panel {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #282828;
+    margin-bottom: 10px;
+}
+.playback-group {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.btn-round {
+    background: none;
+    border: none;
+    color: #b3b3b3;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: all 0.15s ease;
+    padding: 6px;
+}
+.btn-round:hover {
+    color: #ffffff;
+    transform: scale(1.1);
+}
+.btn-main-play {
+    width: 42px;
+    height: 42px;
+    background: #1db954;
+    color: #000000;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 12px rgba(29,185,84,0.3);
+}
+.btn-main-play:hover {
+    background: #1ed760;
+    color: #000;
+    transform: scale(1.06);
+}
+.settings-group {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+.xfade-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #1c1c1c;
+    padding: 3px 10px;
+    border-radius: 16px;
+    border: 1px solid #333;
+}
+.xfade-toggle-pill {
+    background: #2a2a2a;
+    border: 1px solid #444;
+    color: #aaa;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.xfade-toggle-pill.active {
+    background: #1db954;
+    color: #000;
+    border-color: #1db954;
+}
+.xfade-slider-box {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.xfade-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 60px;
+    height: 4px;
+    border-radius: 2px;
+    background: #444;
+    outline: none;
+    cursor: pointer;
+}
+.xfade-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: #1db954;
+    cursor: pointer;
+}
+.xfade-val-label {
+    font-size: 11px;
+    color: #1db954;
+    font-weight: 700;
+    min-width: 26px;
+}
+.volume-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.vol-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 70px;
+    height: 4px;
+    border-radius: 2px;
+    background: #444;
+    outline: none;
+    cursor: pointer;
+}
+.vol-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #fff;
+    cursor: pointer;
+}
+.queue-box {
+    background: #151515;
+    border: 1px solid #242424;
+    border-radius: 8px;
+    overflow: hidden;
+}
+.queue-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 12px;
+    background: #1a1a1a;
+    border-bottom: 1px solid #262626;
+    font-size: 11px;
+    color: #888;
+}
+.queue-scroll {
+    max-height: 175px;
+    overflow-y: auto;
+}
+.queue-scroll::-webkit-scrollbar {
+    width: 6px;
+}
+.queue-scroll::-webkit-scrollbar-thumb {
+    background: #333;
+    border-radius: 3px;
+}
+.queue-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 12px;
+    cursor: pointer;
+    border-bottom: 1px solid #1a1a1a;
+    transition: background 0.15s;
+}
+.queue-row:last-child {
+    border-bottom: none;
+}
+.queue-row:hover {
+    background: #232323;
+}
+.queue-row.active {
+    background: #162b1e;
+    border-left: 3px solid #1db954;
+}
+.queue-num {
+    font-size: 11px;
+    color: #666;
+    min-width: 18px;
+    text-align: right;
+}
+.queue-row.active .queue-num {
+    color: #1db954;
+    font-weight: 700;
+}
+.queue-thumb {
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    object-fit: cover;
+    background: #282828;
+    flex-shrink: 0;
+}
+.queue-details {
+    flex: 1;
+    min-width: 0;
+}
+.queue-row-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #eee;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.queue-row.active .queue-row-title {
+    color: #1db954;
+}
+.queue-row-artist {
+    font-size: 11px;
+    color: #888;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.queue-row-dur {
+    font-size: 11px;
+    color: #666;
+    font-variant-numeric: tabular-nums;
+}
+@media (max-width: 600px) {
+    body {
+        padding: 0;
+    }
+    .player-card {
+        padding: 12px 10px;
+    }
+    .track-title {
+        font-size: 14px;
+    }
+    .track-artist {
+        font-size: 12px;
+    }
+    .controls-panel {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+    }
+    .playback-group {
+        justify-content: center;
+    }
+    .settings-group {
+        justify-content: space-between;
+    }
+}
+</style>
+</head>
+<body>
+<div class="player-card">
+    <div class="now-playing">
+        <div class="cover-box">
+            <img id="cover-img" class="cover-img" alt="Capa" />
+            <div id="cover-fallback" class="cover-fallback">🎵</div>
+        </div>
+        <div class="track-info">
+            <div class="track-top-row">
+                <span id="track-pos" class="track-pos">Faixa 1 de 1</span>
+                <span id="xfade-badge" class="xfade-badge">CROSSFADE</span>
             </div>
-            <small id="status">Clique em Reproduzir para iniciar.</small>
+            <div id="track-title" class="track-title">Carregando playlist...</div>
+            <div id="track-artist" class="track-artist">Deezer Previews</div>
+            <div class="track-tags">
+                <span id="tag-style" class="tag" style="display:none;"></span>
+                <span id="tag-tempo" class="tag" style="display:none;"></span>
+                <span id="tag-genre" class="tag" style="display:none;"></span>
+            </div>
+        </div>
     </div>
-    <script>
-            const sources = {audio_sources};
-            const labels = {audio_labels};
-      const fade = {crossfade_seconds};
-            const audios = sources.map((source) => new Audio(source));
-            let currentIndex = 0;
-            let playing = false;
-            let fadeTimer = null;
-      const button = document.getElementById("play");
-            const previous = document.getElementById("previous");
-            const next = document.getElementById("next");
-            const progress = document.getElementById("progress");
-            const track = document.getElementById("track");
-      const status = document.getElementById("status");
-            function updateTrack() {{
-                track.textContent = labels[currentIndex];
-                progress.value = 0;
-                status.textContent = `Faixa ${{currentIndex + 1}} de ${{audios.length}}`;
-            }}
-            function stopFade() {{
-                if (fadeTimer) clearInterval(fadeTimer);
-                fadeTimer = null;
-            }}
-            function setVolume(audio, volume) {{ audio.volume = Math.max(0, Math.min(1, volume)); }}
-            function playCurrent() {{
-                audios[currentIndex].play();
-                playing = true;
-                button.textContent = "Pausar";
-                status.textContent = `Reproduzindo faixa ${{currentIndex + 1}} de ${{audios.length}}`;
-            }}
-            function pauseCurrent() {{
-                audios[currentIndex].pause();
-                playing = false;
-                button.textContent = "Reproduzir";
-                status.textContent = "Pausado";
-            }}
-            function switchTrack(direction) {{
-                const targetIndex = (currentIndex + direction + audios.length) % audios.length;
-                const oldAudio = audios[currentIndex];
-                const newAudio = audios[targetIndex];
-                stopFade();
-                newAudio.currentTime = 0;
-                if (!playing) {{
-                    oldAudio.pause();
-                    setVolume(oldAudio, 0);
-                    currentIndex = targetIndex;
-                    setVolume(newAudio, 1);
-                    updateTrack();
-                    return;
-                }}
-                setVolume(newAudio, 0);
-                newAudio.play();
-                const startedAt = Date.now();
-                fadeTimer = setInterval(() => {{
-                    const amount = Math.min(1, (Date.now() - startedAt) / (fade * 1000));
-                    setVolume(oldAudio, 1 - amount);
-                    setVolume(newAudio, amount);
-                    if (amount >= 1) {{
-                        stopFade();
-                        oldAudio.pause();
-                        oldAudio.currentTime = 0;
-                    }}
-                }}, 50);
-                currentIndex = targetIndex;
-                updateTrack();
-            }}
-            button.onclick = () => playing ? pauseCurrent() : playCurrent();
-            previous.onclick = () => switchTrack(-1);
-            next.onclick = () => switchTrack(1);
-            progress.oninput = () => {{
-                const audio = audios[currentIndex];
-                if (audio.duration) audio.currentTime = (progress.value / 100) * audio.duration;
-            }};
-            audios.forEach((audio, index) => {{
-                audio.addEventListener("timeupdate", () => {{
-                    if (index === currentIndex && audio.duration) progress.value = (audio.currentTime / audio.duration) * 100;
-                }});
-                audio.addEventListener("ended", () => {{ if (index === currentIndex) switchTrack(1); }});
-            }});
-            setVolume(audios[0], 1);
-            audios.slice(1).forEach((audio) => setVolume(audio, 0));
-            updateTrack();
-    </script>
+
+    <div class="progress-container">
+        <span id="time-current" class="time-num">0:00</span>
+        <input id="progress-bar" class="progress-slider" type="range" min="0" max="100" value="0" step="0.1" />
+        <span id="time-total" class="time-num">0:30</span>
+    </div>
+
+    <div class="controls-panel">
+        <div class="playback-group">
+            <button id="btn-prev" class="btn-round" title="Faixa Anterior">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="19 20 9 12 19 4 19 20"></polygon><line x1="5" y1="4" x2="5" y2="20" stroke="currentColor" stroke-width="2.5"></line></svg>
+            </button>
+            <button id="btn-play" class="btn-main-play" title="Reproduzir / Pausar">
+                <svg id="icon-play" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"></polygon></svg>
+                <svg id="icon-pause" width="22" height="22" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg>
+            </button>
+            <button id="btn-next" class="btn-round" title="Próxima Faixa">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 4 15 12 5 20 5 4"></polygon><line x1="19" y1="4" x2="19" y2="20" stroke="currentColor" stroke-width="2.5"></line></svg>
+            </button>
+        </div>
+
+        <div class="settings-group">
+            <div class="xfade-wrapper">
+                <button id="btn-xfade-toggle" class="xfade-toggle-pill active" title="Alternar Crossfade">Crossfade: ON</button>
+                <div class="xfade-slider-box">
+                    <input id="slider-xfade" class="xfade-slider" type="range" min="0" max="6" step="0.5" value="__DEFAULT_CROSSFADE__" />
+                    <span id="xfade-val-text" class="xfade-val-label">__DEFAULT_CROSSFADE__s</span>
+                </div>
+            </div>
+
+            <div class="volume-wrapper">
+                <button id="btn-mute" class="btn-round" title="Mudo">
+                    <svg id="icon-vol" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07" stroke="currentColor" stroke-width="2" fill="none"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14" stroke="currentColor" stroke-width="2" fill="none"></path></svg>
+                    <svg id="icon-mute" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2"></line><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2"></line></svg>
+                </button>
+                <input id="slider-vol" class="vol-slider" type="range" min="0" max="100" value="85" />
+            </div>
+        </div>
+    </div>
+
+    <div class="queue-box">
+        <div class="queue-header">
+            <span>Fila da Playlist</span>
+            <span id="queue-status">Clique em qualquer faixa para transição suave</span>
+        </div>
+        <div id="queue-scroll" class="queue-scroll"></div>
+    </div>
+</div>
+
+<script>
+const playlist = __PREVIEWS_JSON__;
+let currentIndex = 0;
+let isPlaying = false;
+let isCrossfading = false;
+let crossfadeDuration = parseFloat("__DEFAULT_CROSSFADE__") || 3.0;
+let crossfadeEnabled = crossfadeDuration > 0;
+let masterVolume = 0.85;
+let isMuted = false;
+let crossfadeTimer = null;
+
+const deckA = new Audio();
+const deckB = new Audio();
+deckA.preload = "auto";
+deckB.preload = "auto";
+
+let activeDeck = deckA;
+let inactiveDeck = deckB;
+
+const coverImg = document.getElementById("cover-img");
+const coverFallback = document.getElementById("cover-fallback");
+const trackPos = document.getElementById("track-pos");
+const xfadeBadge = document.getElementById("xfade-badge");
+const trackTitle = document.getElementById("track-title");
+const trackArtist = document.getElementById("track-artist");
+const tagStyle = document.getElementById("tag-style");
+const tagTempo = document.getElementById("tag-tempo");
+const tagGenre = document.getElementById("tag-genre");
+
+const timeCurrent = document.getElementById("time-current");
+const timeTotal = document.getElementById("time-total");
+const progressBar = document.getElementById("progress-bar");
+
+const btnPlay = document.getElementById("btn-play");
+const iconPlay = document.getElementById("icon-play");
+const iconPause = document.getElementById("icon-pause");
+const btnPrev = document.getElementById("btn-prev");
+const btnNext = document.getElementById("btn-next");
+
+const btnXfadeToggle = document.getElementById("btn-xfade-toggle");
+const sliderXfade = document.getElementById("slider-xfade");
+const xfadeValText = document.getElementById("xfade-val-text");
+
+const btnMute = document.getElementById("btn-mute");
+const iconVol = document.getElementById("icon-vol");
+const iconMute = document.getElementById("icon-mute");
+const sliderVol = document.getElementById("slider-vol");
+
+const queueScroll = document.getElementById("queue-scroll");
+const queueStatus = document.getElementById("queue-status");
+
+function formatTime(sec) {
+    if (isNaN(sec) || sec < 0) return "0:00";
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return m + ":" + (s < 10 ? "0" : "") + s;
+}
+
+function updatePlayButton() {
+    if (isPlaying) {
+        iconPlay.style.display = "none";
+        iconPause.style.display = "block";
+    } else {
+        iconPlay.style.display = "block";
+        iconPause.style.display = "none";
+    }
+}
+
+function stopCrossfade() {
+    if (crossfadeTimer) {
+        clearInterval(crossfadeTimer);
+        crossfadeTimer = null;
+    }
+    isCrossfading = false;
+    xfadeBadge.style.display = "none";
+}
+
+function updateVolume() {
+    const baseVol = isMuted ? 0 : masterVolume;
+    if (!isCrossfading) {
+        activeDeck.volume = baseVol;
+        inactiveDeck.volume = 0;
+    }
+    if (isMuted) {
+        iconVol.style.display = "none";
+        iconMute.style.display = "block";
+    } else {
+        iconVol.style.display = "block";
+        iconMute.style.display = "none";
+    }
+}
+
+function loadDeck(deck, index) {
+    if (index >= 0 && index < playlist.length) {
+        deck.src = playlist[index].preview_url;
+        deck.currentTime = 0;
+        deck.volume = isMuted ? 0 : masterVolume;
+    }
+}
+
+function updateUI() {
+    if (!playlist || playlist.length === 0) return;
+    const current = playlist[currentIndex];
+    trackPos.textContent = "Faixa " + (currentIndex + 1) + " de " + playlist.length;
+    trackTitle.textContent = current.title || "Sem título";
+    trackArtist.textContent = current.artist || "Artista desconhecido";
+
+    if (current.cover) {
+        coverImg.src = current.cover;
+        coverImg.style.display = "block";
+        coverFallback.style.display = "none";
+    } else {
+        coverImg.style.display = "none";
+        coverFallback.style.display = "flex";
+    }
+
+    if (current.estilo_musical) {
+        tagStyle.textContent = "Estilo: " + current.estilo_musical;
+        tagStyle.style.display = "inline-block";
+    } else {
+        tagStyle.style.display = "none";
+    }
+
+    if (current.tempo && current.tempo > 0) {
+        tagTempo.textContent = Math.round(current.tempo) + " BPM";
+        tagTempo.style.display = "inline-block";
+    } else {
+        tagTempo.style.display = "none";
+    }
+
+    if (current.track_genre) {
+        tagGenre.textContent = current.track_genre;
+        tagGenre.style.display = "inline-block";
+    } else {
+        tagGenre.style.display = "none";
+    }
+
+    updatePlayButton();
+
+    const rows = queueScroll.querySelectorAll(".queue-row");
+    rows.forEach((row, idx) => {
+        if (idx === currentIndex) {
+            row.classList.add("active");
+            row.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        } else {
+            row.classList.remove("active");
+        }
+    });
+}
+
+function startCrossfade(targetIndex, customDuration) {
+    if (playlist.length <= 1 || targetIndex === currentIndex) return;
+    stopCrossfade();
+    isCrossfading = true;
+    xfadeBadge.style.display = "inline-block";
+
+    const fadeSeconds = (customDuration !== undefined && customDuration !== null) ? customDuration : crossfadeDuration;
+    const fadeMs = Math.max(250, fadeSeconds * 1000);
+    const fadeStart = Date.now();
+    const baseVol = isMuted ? 0 : masterVolume;
+
+    inactiveDeck.src = playlist[targetIndex].preview_url;
+    inactiveDeck.currentTime = 0;
+    inactiveDeck.volume = 0;
+
+    const playPromise = inactiveDeck.play();
+    if (playPromise !== undefined) {
+        playPromise.catch(e => console.warn("Erro no play do incoming deck:", e));
+    }
+
+    crossfadeTimer = setInterval(() => {
+        const elapsed = Date.now() - fadeStart;
+        const t = Math.min(1.0, Math.max(0.0, elapsed / fadeMs));
+
+        // Curva Equal-Power (seno/cosseno)
+        const gainOut = Math.cos(t * Math.PI * 0.5);
+        const gainIn = Math.sin(t * Math.PI * 0.5);
+
+        activeDeck.volume = Math.max(0, Math.min(1, gainOut * baseVol));
+        inactiveDeck.volume = Math.max(0, Math.min(1, gainIn * baseVol));
+
+        if (t >= 1.0) {
+            finalizeCrossfade(targetIndex);
+        }
+    }, 35);
+}
+
+function finalizeCrossfade(newIndex) {
+    stopCrossfade();
+    activeDeck.pause();
+    activeDeck.currentTime = 0;
+    activeDeck.volume = 0;
+
+    const temp = activeDeck;
+    activeDeck = inactiveDeck;
+    inactiveDeck = temp;
+
+    activeDeck.volume = isMuted ? 0 : masterVolume;
+    currentIndex = newIndex;
+    updateUI();
+}
+
+function goToTrack(targetIndex, allowCrossfade = true) {
+    if (targetIndex < 0 || targetIndex >= playlist.length) return;
+    if (targetIndex === currentIndex && isPlaying) return;
+
+    if (isPlaying && allowCrossfade && crossfadeEnabled && crossfadeDuration > 0) {
+        const quickFade = Math.min(crossfadeDuration, 1.2);
+        startCrossfade(targetIndex, quickFade);
+    } else {
+        stopCrossfade();
+        activeDeck.pause();
+        inactiveDeck.pause();
+        inactiveDeck.currentTime = 0;
+        currentIndex = targetIndex;
+        loadDeck(activeDeck, currentIndex);
+        if (isPlaying) {
+            activeDeck.play().catch(e => console.warn("Erro ao iniciar áudio:", e));
+        }
+        updateUI();
+    }
+}
+
+function togglePlay() {
+    if (isPlaying) {
+        activeDeck.pause();
+        inactiveDeck.pause();
+        isPlaying = false;
+        stopCrossfade();
+        activeDeck.volume = isMuted ? 0 : masterVolume;
+        updatePlayButton();
+    } else {
+        if (!activeDeck.src || activeDeck.src !== playlist[currentIndex].preview_url) {
+            loadDeck(activeDeck, currentIndex);
+        }
+        activeDeck.play().then(() => {
+            isPlaying = true;
+            updatePlayButton();
+        }).catch(e => console.warn("Autoplay bloqueado ou erro:", e));
+    }
+}
+
+function attachAudioEvents(audio) {
+    audio.addEventListener("timeupdate", () => {
+        if (audio !== activeDeck) return;
+        if (audio.duration && !isNaN(audio.duration)) {
+            const pct = (audio.currentTime / audio.duration) * 100;
+            progressBar.value = pct;
+            timeCurrent.textContent = formatTime(audio.currentTime);
+            timeTotal.textContent = formatTime(audio.duration);
+
+            if (isPlaying && crossfadeEnabled && crossfadeDuration > 0 && !isCrossfading) {
+                const remaining = audio.duration - audio.currentTime;
+                if (remaining <= crossfadeDuration && audio.duration > crossfadeDuration) {
+                    const nextIndex = (currentIndex + 1) % playlist.length;
+                    startCrossfade(nextIndex, crossfadeDuration);
+                }
+            }
+        }
+    });
+
+    audio.addEventListener("ended", () => {
+        if (audio === activeDeck) {
+            if (isCrossfading) {
+                const nextIndex = (currentIndex + 1) % playlist.length;
+                finalizeCrossfade(nextIndex);
+            } else {
+                const nextIndex = (currentIndex + 1) % playlist.length;
+                if (isPlaying) {
+                    goToTrack(nextIndex, false);
+                }
+            }
+        }
+    });
+
+    audio.addEventListener("error", (e) => {
+        console.warn("Erro no elemento de áudio:", e);
+        if (audio === activeDeck && isPlaying) {
+            queueStatus.textContent = "Erro no preview. Pulando faixa...";
+            setTimeout(() => {
+                const nextIndex = (currentIndex + 1) % playlist.length;
+                goToTrack(nextIndex, false);
+            }, 600);
+        }
+    });
+}
+
+attachAudioEvents(deckA);
+attachAudioEvents(deckB);
+
+btnPlay.onclick = togglePlay;
+btnPrev.onclick = () => {
+    const prevIndex = (currentIndex - 1 + playlist.length) % playlist.length;
+    goToTrack(prevIndex, true);
+};
+btnNext.onclick = () => {
+    const nextIndex = (currentIndex + 1) % playlist.length;
+    goToTrack(nextIndex, true);
+};
+
+progressBar.oninput = () => {
+    if (activeDeck.duration) {
+        if (isCrossfading) {
+            stopCrossfade();
+            inactiveDeck.pause();
+            inactiveDeck.currentTime = 0;
+            activeDeck.volume = isMuted ? 0 : masterVolume;
+        }
+        activeDeck.currentTime = (progressBar.value / 100) * activeDeck.duration;
+        timeCurrent.textContent = formatTime(activeDeck.currentTime);
+    }
+};
+
+sliderXfade.oninput = () => {
+    crossfadeDuration = parseFloat(sliderXfade.value);
+    xfadeValText.textContent = crossfadeDuration.toFixed(1) + "s";
+    if (crossfadeDuration === 0) {
+        crossfadeEnabled = false;
+        btnXfadeToggle.classList.remove("active");
+        btnXfadeToggle.textContent = "Crossfade: OFF";
+    } else {
+        crossfadeEnabled = true;
+        btnXfadeToggle.classList.add("active");
+        btnXfadeToggle.textContent = "Crossfade: ON";
+    }
+};
+
+btnXfadeToggle.onclick = () => {
+    crossfadeEnabled = !crossfadeEnabled;
+    if (crossfadeEnabled) {
+        if (crossfadeDuration === 0) crossfadeDuration = 3.0;
+        sliderXfade.value = crossfadeDuration;
+        xfadeValText.textContent = crossfadeDuration.toFixed(1) + "s";
+        btnXfadeToggle.classList.add("active");
+        btnXfadeToggle.textContent = "Crossfade: ON";
+    } else {
+        btnXfadeToggle.classList.remove("active");
+        btnXfadeToggle.textContent = "Crossfade: OFF";
+    }
+};
+
+sliderVol.oninput = () => {
+    masterVolume = sliderVol.value / 100;
+    isMuted = false;
+    updateVolume();
+};
+
+btnMute.onclick = () => {
+    isMuted = !isMuted;
+    updateVolume();
+};
+
+function renderQueueList() {
+    queueScroll.innerHTML = "";
+    playlist.forEach((track, idx) => {
+        const row = document.createElement("div");
+        row.className = "queue-row" + (idx === currentIndex ? " active" : "");
+        row.onclick = () => goToTrack(idx, true);
+
+        const num = document.createElement("span");
+        num.className = "queue-num";
+        num.textContent = (idx + 1);
+
+        const thumb = document.createElement("img");
+        thumb.className = "queue-thumb";
+        thumb.src = track.cover || "";
+        thumb.onerror = () => { thumb.style.display = "none"; };
+        if (!track.cover) thumb.style.display = "none";
+
+        const details = document.createElement("div");
+        details.className = "queue-details";
+
+        const title = document.createElement("div");
+        title.className = "queue-row-title";
+        title.textContent = track.title || ("Faixa " + (idx + 1));
+
+        const artist = document.createElement("div");
+        artist.className = "queue-row-artist";
+        artist.textContent = track.artist || "";
+
+        details.appendChild(title);
+        details.appendChild(artist);
+
+        const dur = document.createElement("span");
+        dur.className = "queue-row-dur";
+        dur.textContent = "0:30";
+
+        row.appendChild(num);
+        if (track.cover) row.appendChild(thumb);
+        row.appendChild(details);
+        row.appendChild(dur);
+
+        queueScroll.appendChild(row);
+    });
+}
+
+renderQueueList();
+if (playlist.length > 0) {
+    loadDeck(activeDeck, 0);
+    updateUI();
+}
+</script>
+</body>
+</html>
     """
-    components.html(component, height=100)
+    component = component_template.replace("__PREVIEWS_JSON__", previews_json).replace("__DEFAULT_CROSSFADE__", f"{default_crossfade:.1f}")
+    components.html(component, height=540)
 
 
-st.set_page_config(page_title="Spotify Music Explorer", layout="wide")
-st.title("Playlist Studio")
-st.caption("Monte playlists por ambiente, perfil sonoro e compatibilidade entre faixas")
+
+st.set_page_config(page_title="Playlist Studio", page_icon="🎵", layout="centered", initial_sidebar_state="collapsed")
+
+# Initialize session state early to prevent KeyError
+if "playlist" not in st.session_state:
+    st.session_state["playlist"] = None
+if "previews" not in st.session_state:
+    st.session_state["previews"] = []
+if "playlist_env" not in st.session_state:
+    st.session_state["playlist_env"] = ""
+
+st.markdown(
+    """
+    <style>
+    /* Remove sidebar and its toggle button entirely */
+    [data-testid="stSidebar"], [data-testid="stSidebarCollapseButton"], button[data-testid="baseButton-headerNoPadding"] {
+        display: none !important;
+    }
+    /* Hide the deploy button if present to prevent header overlap */
+    .stAppDeployButton, header[data-testid="stHeader"] .stAppDeployButton {
+        display: none !important;
+    }
+    /* Header background transparent */
+    header[data-testid="stHeader"] {
+        background: transparent !important;
+    }
+    /* Centralized, mobile-friendly container with ample top padding for toolbar */
+    .block-container {
+        max-width: 780px !important;
+        padding-top: 5.2rem !important;
+        padding-bottom: 2.5rem !important;
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+        margin: 0 auto !important;
+    }
+    /* Header typography */
+    .studio-header {
+        text-align: center;
+        margin-top: 0.8rem;
+        margin-bottom: 1.8rem;
+    }
+    .studio-title {
+        font-size: 2.2rem;
+        font-weight: 800;
+        letter-spacing: -0.5px;
+        margin-bottom: 0.3rem;
+        color: #ffffff;
+    }
+    .studio-title span {
+        color: #1db954;
+    }
+    .studio-subtitle {
+        font-size: 1.02rem;
+        color: #b3b3b3;
+        line-height: 1.4;
+    }
+    /* Touch-friendly buttons */
+    .stButton > button {
+        border-radius: 24px !important;
+        font-weight: 700 !important;
+        padding: 0.65rem 1.4rem !important;
+        font-size: 1.05rem !important;
+        transition: all 0.2s ease !important;
+    }
+    .stDownloadButton > button {
+        border-radius: 20px !important;
+        font-weight: 600 !important;
+        padding: 0.5rem 1.2rem !important;
+    }
+    /* Clean expander styling */
+    div[data-testid="stExpander"] {
+        border-radius: 12px !important;
+        border: 1px solid #282828 !important;
+        background: #181818 !important;
+        margin-bottom: 1rem !important;
+    }
+    </style>
+    <div class="studio-header">
+        <div class="studio-title">🎵 Playlist <span>Studio</span></div>
+        <div class="studio-subtitle">Curadoria musical inteligente e transições perfeitas para o seu espaço comercial</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 try:
     dataset = load_dataset()
@@ -209,26 +1160,29 @@ except Exception as exc:
     st.error(f"Erro ao carregar o dataset: {exc}")
     st.stop()
 
-feature_columns = ["danceability", "energy", "speechiness", "acousticness", "instrumentalness", "liveness", "valence"]
+feature_columns = ["energy", "acousticness", "valence", "instrumentalness"]
+feature_labels = {
+    "energy": ("Energia", "Intensidade e pegada sonora (Calmo ↔ Intenso)"),
+    "acousticness": ("Acústico", "Instrumentos orgânicos vs. produção eletrônica (Sintético ↔ Orgânico)"),
+    "valence": ("Humor & Vibe", "Positividade emocional da música (Sério/Melancólico ↔ Solar/Alegre)"),
+    "instrumentalness": ("Instrumental", "Presença de vocais vs. batidas/arranjos instrumentais (Com Vocais ↔ Instrumental)"),
+}
 dataset_means = pd.Series({
-    "danceability": 0.562,
     "energy": 0.636,
-    "speechiness": 0.080,
     "acousticness": 0.323,
-    "instrumentalness": 0.183,
-    "liveness": 0.214,
     "valence": 0.466,
+    "instrumentalness": 0.183,
 })
 
 environment_presets = {
-    "Restaurante": {"danceability": (0.30, 0.60), "energy": (0.20, 0.55), "speechiness": (0.00, 0.15), "acousticness": (0.35, 1.00), "instrumentalness": (0.10, 0.70), "liveness": (0.00, 0.35), "valence": (0.45, 0.85)},
-    "Loja de alto padrão": {"danceability": (0.25, 0.60), "energy": (0.15, 0.50), "speechiness": (0.00, 0.12), "acousticness": (0.25, 0.85), "instrumentalness": (0.15, 0.80), "liveness": (0.00, 0.25), "valence": (0.45, 0.80)},
-    "High fashion": {"danceability": (0.45, 0.85), "energy": (0.35, 0.80), "speechiness": (0.00, 0.20), "acousticness": (0.00, 0.45), "instrumentalness": (0.25, 1.00), "liveness": (0.00, 0.30), "valence": (0.35, 0.75)},
-    "Relaxante": {"danceability": (0.00, 0.40), "energy": (0.00, 0.35), "speechiness": (0.00, 0.10), "acousticness": (0.55, 1.00), "instrumentalness": (0.35, 1.00), "liveness": (0.00, 0.25), "valence": (0.25, 0.75)},
-    "Academia": {"danceability": (0.55, 1.00), "energy": (0.65, 1.00), "speechiness": (0.00, 0.35), "acousticness": (0.00, 0.45), "instrumentalness": (0.00, 0.60), "liveness": (0.00, 0.40), "valence": (0.45, 1.00)},
-    "Loja de roupas": {"danceability": (0.45, 0.90), "energy": (0.35, 0.75), "speechiness": (0.00, 0.25), "acousticness": (0.05, 0.55), "instrumentalness": (0.05, 0.75), "liveness": (0.00, 0.35), "valence": (0.50, 0.95)},
-    "Shopping": {"danceability": (0.45, 0.85), "energy": (0.35, 0.75), "speechiness": (0.00, 0.25), "acousticness": (0.10, 0.60), "instrumentalness": (0.05, 0.65), "liveness": (0.00, 0.35), "valence": (0.45, 0.90)},
-    "Mercado": {"danceability": (0.35, 0.80), "energy": (0.30, 0.70), "speechiness": (0.00, 0.25), "acousticness": (0.15, 0.70), "instrumentalness": (0.00, 0.55), "liveness": (0.00, 0.40), "valence": (0.45, 0.90)},
+    "Restaurante": {"energy": (0.20, 0.55), "acousticness": (0.35, 1.00), "valence": (0.35, 0.80), "instrumentalness": (0.00, 0.60)},
+    "Loja de alto padrão": {"energy": (0.20, 0.60), "acousticness": (0.25, 0.90), "valence": (0.35, 0.75), "instrumentalness": (0.10, 0.85)},
+    "High fashion": {"energy": (0.45, 0.85), "acousticness": (0.00, 0.35), "valence": (0.25, 0.70), "instrumentalness": (0.20, 1.00)},
+    "Relaxante": {"energy": (0.00, 0.35), "acousticness": (0.60, 1.00), "valence": (0.15, 0.65), "instrumentalness": (0.30, 1.00)},
+    "Academia": {"energy": (0.70, 1.00), "acousticness": (0.00, 0.30), "valence": (0.30, 0.95), "instrumentalness": (0.00, 0.80)},
+    "Loja de roupas": {"energy": (0.45, 0.85), "acousticness": (0.05, 0.50), "valence": (0.45, 0.95), "instrumentalness": (0.00, 0.50)},
+    "Shopping": {"energy": (0.40, 0.80), "acousticness": (0.10, 0.65), "valence": (0.40, 0.90), "instrumentalness": (0.00, 0.50)},
+    "Mercado": {"energy": (0.35, 0.85), "acousticness": (0.10, 0.70), "valence": (0.45, 0.95), "instrumentalness": (0.00, 0.45)},
 }
 
 environment_popularity_ranges = {
@@ -253,25 +1207,24 @@ environment_genre_presets = {
     "Mercado": ["pop", "dance", "disco", "house", "latin", "latino", "reggaeton", "brazil", "forro", "samba", "pagode", "mpb", "sertanejo", "reggae", "dancehall", "country", "folk", "rock", "funk", "groove", "soul", "r-n-b", "k-pop"],
 }
 
-environment_cluster_presets = {
-    "Restaurante": [0, 1, 5],
-    "Loja de alto padrão": [0, 1, 5],
-    "High fashion": [1, 4, 5],
-    "Relaxante": [0, 6],
-    "Academia": [1, 2, 3, 4, 5],
-    "Loja de roupas": [1, 4, 5],
-    "Shopping": [1, 4, 5],
-    "Mercado": [1, 2, 4],
+profile_descriptions = {
+    0: ("Social & Ensolarado", "Músicas alegres, pop e dançantes, com vocais marcantes e clima vibrante para confraternizações e lojas dinâmicas."),
+    1: ("Ambiental & Relaxante", "Sons calmos, orgânicos e puramente instrumentais para relaxamento, foco mental, spa e bem-estar."),
+    2: ("Acústico & Intimista", "Arranjos acústicos e orgânicos com vocais suaves e elegantes; perfeito para jantares, conversas e sofisticação."),
+    3: ("Eletrônico & Moderno", "Batidas eletrônicas contínuas e contemporâneas sem vocais; atmosfera urbana, lounge e moda."),
+    4: ("Intenso & Dinâmico", "Ritmo acelerado, guitarras ou batidas pesadas com alta intensidade física; ideal para treinos e academias."),
 }
+profile_names = {cid: info[0] for cid, info in profile_descriptions.items()}
 
-cluster_descriptions = {
-    0: ("Acústico e introspectivo", "Baixa energia, alta acousticness e perfil suave."),
-    1: ("Dançante e positivo", "Alta danceability, energia e valence; indicado para ambientes sociais."),
-    2: ("Performance ao vivo", "Energia e liveness elevadas; lembra shows e apresentações."),
-    3: ("Intenso e sombrio", "Energia muito alta e valence baixa; perfil pesado e dramático."),
-    4: ("Dançante e vocalizado", "Danceability e speechiness elevadas; compatível com rap e funk."),
-    5: ("Eletrônico instrumental", "Alta instrumentalness e energia; próximo de techno e house."),
-    6: ("Ambiental e relaxante", "Baixa energia, alta instrumentalness e acousticness."),
+environment_style_presets = {
+    "Restaurante": ["Acústico & Intimista", "Social & Ensolarado", "Ambiental & Relaxante"],
+    "Loja de alto padrão": ["Acústico & Intimista", "Ambiental & Relaxante", "Eletrônico & Moderno"],
+    "High fashion": ["Eletrônico & Moderno", "Social & Ensolarado"],
+    "Relaxante": ["Ambiental & Relaxante", "Acústico & Intimista"],
+    "Academia": ["Intenso & Dinâmico", "Eletrônico & Moderno", "Social & Ensolarado"],
+    "Loja de roupas": ["Social & Ensolarado", "Eletrônico & Moderno"],
+    "Shopping": ["Social & Ensolarado", "Acústico & Intimista"],
+    "Mercado": ["Social & Ensolarado", "Intenso & Dinâmico"],
 }
 
 def camelot_label(key, mode):
@@ -309,73 +1262,122 @@ def build_playlist(filtered, size, seed):
     result = filtered.loc[selected].copy()
     result["key_camelot"] = [camelot_label(key, mode) for key, mode in zip(result["key"], result["mode"])]
     result["tempo_difference"] = [np.nan, *[(result.iloc[i]["tempo"] - result.iloc[i - 1]["tempo"]) for i in range(1, len(result))]]
+    result["estilo_musical"] = result["cluster"].map(profile_names)
     return result
 
-st.sidebar.header("Configuração da playlist")
-selected_environment = st.sidebar.selectbox("Ambiente", list(environment_presets))
+st.markdown("### 1. Ambiente do seu Espaço")
+selected_environment = st.selectbox(
+    "Selecione o Ambiente",
+    list(environment_presets),
+    label_visibility="collapsed",
+    help="Escolha o tipo de ambiente ou proposta do seu espaço.",
+)
 preset_ranges = environment_presets[selected_environment]
-feature_ranges = {}
-st.sidebar.caption("Ranges musicais")
-for feature in feature_columns:
-    feature_ranges[feature] = st.sidebar.slider(
-        feature.capitalize(),
-        0.0,
-        1.0,
-        preset_ranges[feature],
-        0.01,
-        format="%.2f",
-        key=f"{selected_environment}_{feature}",
-    )
 
-popularity_range = st.sidebar.slider(
-    "Popularidade",
-    min_value=0,
-    max_value=100,
-    value=environment_popularity_ranges[selected_environment],
-    step=1,
-    key=f"{selected_environment}_popularity",
-    help="Ambientes acessíveis e casuais começam priorizando músicas populares.",
-)
-
-available_genres = sorted(dataset["track_genre"].dropna().unique())
-genre_preset = [genre for genre in environment_genre_presets[selected_environment] if genre in available_genres]
-selected_genres = st.sidebar.multiselect(
-    "Gêneros (vazio = todos)",
-    available_genres,
-    default=genre_preset,
-    key=f"{selected_environment}_genres",
-)
-st.sidebar.caption(
-    f"Preset amplo: {len(genre_preset)} gêneros. Limpe a seleção para liberar todos."
-)
-
-cluster_options = sorted(dataset["cluster"].dropna().unique().tolist())
-available_clusters = set(cluster_options)
-recommended_clusters = [
-    cluster_id
-    for cluster_id in environment_cluster_presets[selected_environment]
-    if cluster_id in available_clusters
+available_styles = [info[0] for info in profile_descriptions.values()]
+style_to_cluster = {info[0]: cid for cid, info in profile_descriptions.items()}
+recommended_styles = [
+    s for s in environment_style_presets[selected_environment] if s in available_styles
 ]
-selected_clusters = st.sidebar.multiselect(
-    "Perfis de músicas / clusters (vazio = todos)",
-    cluster_options,
-    default=recommended_clusters,
-    key=f"{selected_environment}_clusters",
-)
-st.sidebar.caption(
-    "Clusters sugeridos: "
-    + ", ".join(str(cluster_id) for cluster_id in recommended_clusters)
-)
-avoid_explicit = st.sidebar.checkbox("Evitar conteúdo explícito", value=True)
-playlist_size = st.sidebar.slider("Faixas na playlist", 5, 100, 20)
-random_seed = st.sidebar.number_input("Semente (0 = aleatória)", min_value=0, max_value=999999, value=0, step=1)
-use_all = st.sidebar.checkbox("Selecionar todas as músicas possíveis", value=False)
 
-with st.expander("Médias dos atributos no dataset"):
-    st.dataframe(
-        dataset_means.rename("média").to_frame().round(3),
-        use_container_width=True,
+st.markdown("### 2. Atmosferas e Estilos Musicais")
+selected_styles = st.multiselect(
+    "Estilos Musicais Selecionados",
+    available_styles,
+    default=recommended_styles,
+    key=f"{selected_environment}_styles",
+    label_visibility="collapsed",
+    help="Filtre as atmosferas sonoras desejadas para o seu ambiente.",
+)
+st.caption("✨ **Estilos sugeridos:** " + ", ".join(recommended_styles))
+selected_clusters = [style_to_cluster[s] for s in selected_styles]
+
+with st.expander("ℹ️ Conhecer as 5 Atmosferas Musicais", expanded=False):
+    style_profile_df = pd.DataFrame([
+        {
+            "Estilo Musical": name,
+            "Sensação & Características": description,
+            "Recomendado para o Ambiente": "✨ Sim" if name in recommended_styles else "Opcional",
+        }
+        for cid, (name, description) in profile_descriptions.items()
+    ])
+    st.dataframe(style_profile_df, hide_index=True, use_container_width=True)
+
+with st.expander("⚙️ Ajustes de Som e Filtros Avançados (Opcional)", expanded=False):
+    st.markdown("#### Dimensões Sonoras")
+    feature_ranges = {}
+    for feature in feature_columns:
+        label, help_text = feature_labels[feature]
+        feature_ranges[feature] = st.slider(
+            label,
+            0.0,
+            1.0,
+            preset_ranges[feature],
+            0.01,
+            format="%.2f",
+            key=f"{selected_environment}_{feature}",
+            help=help_text,
+        )
+
+    st.markdown("#### Popularidade e Gêneros")
+    popularity_range = st.slider(
+        "Faixa de Popularidade das Músicas",
+        min_value=0,
+        max_value=100,
+        value=environment_popularity_ranges[selected_environment],
+        step=1,
+        key=f"{selected_environment}_popularity",
+        help="Ambientes casuais priorizam músicas conhecidas (maior popularidade).",
     )
+
+    available_genres = sorted(dataset["track_genre"].dropna().unique())
+    genre_preset = [genre for genre in environment_genre_presets[selected_environment] if genre in available_genres]
+    selected_genres = st.multiselect(
+        "Gêneros Musicais Específicos (vazio = todos)",
+        available_genres,
+        default=genre_preset,
+        key=f"{selected_environment}_genres",
+    )
+    st.caption(f"Preset amplo: {len(genre_preset)} gêneros pré-selecionados.")
+
+    col_chk1, col_chk2 = st.columns(2)
+    with col_chk1:
+        avoid_explicit = st.checkbox("Evitar conteúdo explícito", value=True)
+    with col_chk2:
+        use_all = st.checkbox("Selecionar todas as músicas elegíveis", value=False)
+
+    random_seed = st.number_input(
+        "Semente aleatória (0 = variada a cada clique)",
+        min_value=0,
+        max_value=999999,
+        value=0,
+        step=1,
+    )
+
+    with st.expander("Médias de referência do acervo musical", expanded=False):
+        ref_df = pd.DataFrame([
+            {
+                "Atributo": feature_labels[f][0],
+                "Descrição": feature_labels[f][1],
+                "Média no Acervo": f"{dataset_means[f]:.2f}",
+            }
+            for f in feature_columns
+        ])
+        st.dataframe(ref_df, hide_index=True, use_container_width=True)
+
+if "feature_ranges" not in locals():
+    feature_ranges = {feature: preset_ranges[feature] for feature in feature_columns}
+if "popularity_range" not in locals():
+    popularity_range = environment_popularity_ranges[selected_environment]
+if "selected_genres" not in locals():
+    available_genres = sorted(dataset["track_genre"].dropna().unique())
+    selected_genres = [g for g in environment_genre_presets[selected_environment] if g in available_genres]
+if "avoid_explicit" not in locals():
+    avoid_explicit = True
+if "use_all" not in locals():
+    use_all = False
+if "random_seed" not in locals():
+    random_seed = 0
 
 filtered_dataset = dataset.copy()
 for column in feature_columns + ["key", "mode", "tempo", "popularity"]:
@@ -410,85 +1412,113 @@ outside_preference = pd.DataFrame({
 }).div(range_width).mean(axis=1)
 filtered_dataset["fit_score"] = 1 - (distance_to_target * 0.75 + outside_preference * 0.25)
 
-st.subheader("Perfil dos clusters")
-cluster_profile = pd.DataFrame([{"cluster": cluster_id, "perfil": name, "descrição": description, "recomendado": cluster_id in recommended_clusters} for cluster_id, (name, description) in cluster_descriptions.items()])
-st.dataframe(cluster_profile, hide_index=True, use_container_width=True)
+st.markdown("---")
+playlist_size = st.slider("Tamanho da Playlist (músicas)", 5, 50, 20)
 
-st.subheader("Playlist gerada")
+col_gen, col_clear = st.columns([3, 1])
+with col_gen:
+    generate_clicked = st.button("🎵 Gerar Playlist", type="primary", use_container_width=True)
+with col_clear:
+    if st.session_state.get("playlist") is not None:
+        if st.button("Limpar", use_container_width=True):
+            st.session_state["playlist"] = None
+            st.session_state["previews"] = []
+            st.session_state["playlist_env"] = ""
+            st.rerun()
+
 st.caption(
-    f"{len(filtered_dataset):,} músicas elegíveis após gênero, cluster, popularidade e conteúdo explícito. "
-    "Os ranges musicais funcionam como preferência de ranking, sem eliminar faixas."
+    f"🔍 **{len(filtered_dataset):,}** faixas elegíveis para o ambiente **{selected_environment}**."
 )
-if st.button("Gerar playlist", type="primary"):
+
+if generate_clicked:
     selection_size = len(filtered_dataset) if use_all else playlist_size
     playlist = build_playlist(filtered_dataset, selection_size, int(random_seed))
     if playlist.empty:
         st.warning("Nenhuma música corresponde aos filtros selecionados.")
+        st.session_state["playlist"] = None
+        st.session_state["previews"] = []
     else:
-        st.success(f"{len(playlist)} faixas selecionadas a partir de {len(filtered_dataset)} candidatas.")
-        display_columns = ["track_name", "artists", "track_genre", "cluster", "popularity", "key_camelot", "tempo", "tempo_difference", *feature_columns]
-        st.dataframe(playlist[[column for column in display_columns if column in playlist.columns]], use_container_width=True, height=560)
-        st.download_button("Baixar playlist CSV", playlist.to_csv(index=False).encode("utf-8"), f"playlist_{selected_environment.lower().replace(' ', '_')}.csv", "text/csv")
+        st.session_state["playlist"] = playlist
+        st.session_state["playlist_env"] = selected_environment
+        with st.spinner("Buscando previews na API Deezer..."):
+            previews = fetch_all_previews(playlist, max_tracks=min(selection_size, 40))
+            st.session_state["previews"] = previews
+        st.rerun()
 
-        st.subheader("Previews Deezer")
-        st.caption("Os previews têm aproximadamente 30 segundos e são fornecidos pela API do Deezer.")
-        st.info("A fila tenta carregar a playlist inteira no cache. Faixas sem preview são puladas automaticamente.")
-        preview_tracks = playlist
-        previews = []
-        for position, (_, track) in enumerate(preview_tracks.iterrows(), start=1):
-            try:
-                match = find_deezer_preview(track["track_name"], track["artists"])
-                if match is None:
-                    st.warning(f"Preview não encontrado: {track['track_name']}")
-                    continue
-                preview_path = cache_preview(match["preview_url"], position)
-                preview_data = preview_path.read_bytes()
-                data_url = "data:audio/mpeg;base64," + base64.b64encode(preview_data).decode("ascii")
-                previews.append({
-                    "position": position,
-                    "title": match["title"],
-                    "artist": match["artist"],
-                    "path": preview_path,
-                    "data": preview_data,
-                    "data_url": data_url,
-                })
-            except requests.RequestException:
-                st.warning(f"Não foi possível consultar o Deezer: {track['track_name']}")
-            except OSError:
-                st.warning(f"Não foi possível armazenar o preview: {track['track_name']}")
+if st.session_state.get("playlist") is not None:
+    playlist = st.session_state["playlist"]
+    previews = st.session_state.get("previews", [])
 
+    if "estilo_musical" not in playlist.columns and "cluster" in playlist.columns:
+        playlist["estilo_musical"] = playlist["cluster"].map(profile_names)
+
+    st.markdown("---")
+    st.success(f"✨ Playlist para **{st.session_state.get('playlist_env', selected_environment)}** gerada com sucesso ({len(playlist)} faixas)!")
+
+    if previews:
+        st.markdown("### 🎧 Player com Efeito Crossfade")
+        st.caption("Transições suaves de áudio entre as faixas geradas:")
+        render_crossfade_player(previews, default_crossfade=3.0)
+    else:
+        st.warning("Nenhum preview de áudio foi encontrado no Deezer para as faixas selecionadas.")
+
+    col_csv, col_zip = st.columns(2)
+    with col_csv:
+        csv_name = f"playlist_{st.session_state.get('playlist_env', selected_environment).lower().replace(' ', '_')}.csv"
+        st.download_button("📥 Baixar Playlist (CSV)", playlist.to_csv(index=False).encode("utf-8"), csv_name, "text/csv", use_container_width=True)
+    with col_zip:
         if previews:
-            st.download_button(
-                "Baixar previews (ZIP)",
-                preview_archive(previews),
-                "deezer_previews.zip",
-                "application/zip",
-            )
-            if len(previews) >= 2:
-                st.markdown("**Crossfade experimental**")
-                st.caption("O crossfade usa Web Audio API e começa somente após seu clique, por restrições do navegador.")
-                crossfade_seconds = st.slider("Duração do crossfade (segundos)", 1.0, 8.0, 3.0, 0.5)
-                render_crossfade_player(previews, crossfade_seconds)
+            zip_bytes = create_previews_zip(previews)
+            st.download_button("📦 Baixar Músicas (ZIP)", zip_bytes, "deezer_previews.zip", "application/zip", use_container_width=True)
 
-st.divider()
-st.subheader("Consulta SQL avançada")
-examples = {
-    "Top 10 músicas por popularidade": "SELECT track_name, artists, popularity FROM tracks ORDER BY popularity DESC LIMIT 10;",
-    "Gêneros mais frequentes": "SELECT track_genre, COUNT(*) AS total FROM tracks GROUP BY track_genre ORDER BY total DESC LIMIT 10;",
-    "Músicas com maior danceability": "SELECT track_name, danceability, popularity FROM tracks ORDER BY danceability DESC LIMIT 10;",
-    "Faixas com energia alta": "SELECT track_name, energy, popularity FROM tracks WHERE energy > 0.8 ORDER BY popularity DESC LIMIT 10;",
-    "Músicas mais longas": "SELECT track_name, duration_ms FROM tracks ORDER BY duration_ms DESC LIMIT 10;",
-}
+    with st.expander("📋 Ver Lista Completa de Faixas", expanded=True):
+        display_columns = [
+            "track_name",
+            "artists",
+            "track_genre",
+            "estilo_musical",
+            "popularity",
+            "tempo",
+            *feature_columns,
+        ]
+        display_rename = {
+            "track_name": "Música",
+            "artists": "Artista",
+            "track_genre": "Gênero",
+            "estilo_musical": "Estilo Musical",
+            "popularity": "Popularidade",
+            "tempo": "BPM (Andamento)",
+            "energy": "Energia",
+            "acousticness": "Acústico",
+            "valence": "Humor (Valence)",
+            "instrumentalness": "Instrumental",
+        }
+        friendly_df = playlist[[column for column in display_columns if column in playlist.columns]].rename(columns=display_rename)
+        st.dataframe(friendly_df, use_container_width=True, height=360)
 
-selected_example = st.selectbox("Escolha um exemplo", list(examples.keys()))
-query = st.text_area("SQL", value=examples[selected_example], height=180)
+st.markdown("---")
+with st.expander("🔍 Consulta SQL ao Acervo (Modo Desenvolvedor)", expanded=False):
+    st.caption("Execute consultas SQL diretas no banco de dados SQLite:")
+    examples = {
+        "Top 10 músicas por popularidade": "SELECT track_name, artists, popularity FROM tracks ORDER BY popularity DESC LIMIT 10;",
+        "Gêneros mais frequentes": "SELECT track_genre, COUNT(*) AS total FROM tracks GROUP BY track_genre ORDER BY total DESC LIMIT 10;",
+        "Faixas acústicas mais populares": "SELECT track_name, acousticness, artists FROM tracks WHERE acousticness > 0.8 ORDER BY popularity DESC LIMIT 10;",
+        "Faixas com energia alta": "SELECT track_name, energy, popularity FROM tracks WHERE energy > 0.8 ORDER BY popularity DESC LIMIT 10;",
+        "Músicas mais longas": "SELECT track_name, duration_ms FROM tracks ORDER BY duration_ms DESC LIMIT 10;",
+    }
+    selected_example = st.selectbox("Exemplos de consulta", list(examples.keys()))
+    query = st.text_area("Comando SQL", value=examples[selected_example], height=130)
 
-if st.button("Executar consulta"):
-    try:
-        result = execute_query(query)
-        st.subheader("Resultado")
-        st.dataframe(result, use_container_width=True)
-    except Exception as exc:
-        st.error(f"Consulta inválida: {exc}")
+    if st.button("Executar Consulta SQL"):
+        try:
+            result = execute_query(query)
+            st.dataframe(result, use_container_width=True)
+        except Exception as exc:
+            st.error(f"Erro na consulta: {exc}")
 
-st.caption(f"Dataset carregado: {len(dataset):,} faixas | {len(dataset.columns)} colunas")
+st.markdown(
+    f"<div style='text-align:center; color:#777; font-size:0.85rem; margin-top:2.5rem;'>"
+    f"Acervo Spotify: {len(dataset):,} faixas disponíveis"
+    f"</div>",
+    unsafe_allow_html=True,
+)
