@@ -34,6 +34,9 @@ Com base no estudo seminal de **Ronald E. Milliman (1982)** sobre o impacto da m
 - **Ritmo Acelerado (Fast Tempo — acima de 115 BPM)**: Acelera o fluxo e a rotação de clientes (essencial para restaurantes de alta rotatividade nos horários de pico) ou fornece cadência fisiológica de incentivo em academias e centros esportivos.
 
 ### C. Sequenciamento Harmônico (Camelot Wheel)
+
+![Camelot Wheel](./assets/camelot-simple.png){ width="300" align="center"}
+
 Para evitar quebras abruptas de tonalidade entre faixas sucessivas, o algoritmo ordena a fila de reprodução através da **Roda de Camelot** (afinidade de armadura e modo musical), garantindo transições harmônicas naturais como as realizadas por DJs profissionais.
 
 ---
