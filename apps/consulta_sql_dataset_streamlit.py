@@ -123,6 +123,8 @@ def fetch_all_previews(playlist_df: pd.DataFrame, max_tracks: int = 40) -> list[
                 "tempo": float(track.get("tempo", 0.0)) if pd.notna(track.get("tempo")) else 0.0,
                 "track_genre": str(track.get("track_genre", "")),
                 "estilo_musical": str(track.get("estilo_musical", "")),
+                "match": float(track.get("match", 0.0)) if pd.notna(track.get("match")) else 0.0,
+                "rank_score": float(track.get("rank_display", 0.0)) if pd.notna(track.get("rank_display")) else 0.0,
             }
         return None
 
@@ -607,6 +609,8 @@ body {
                 <span id="tag-style" class="tag" style="display:none;"></span>
                 <span id="tag-tempo" class="tag" style="display:none;"></span>
                 <span id="tag-genre" class="tag" style="display:none;"></span>
+                <span id="tag-match" class="tag" style="display:none; background: rgba(29, 185, 84, 0.2); border-color: #1db954;"></span>
+                <span id="tag-key" class="tag" style="display:none;"></span>
             </div>
         </div>
     </div>
@@ -660,7 +664,7 @@ body {
 </div>
 
 <script>
-const playlist = __PREVIEWS_JSON__;
+let playlist = __PREVIEWS_JSON__;
 let currentIndex = 0;
 let isPlaying = false;
 let isCrossfading = false;
@@ -687,6 +691,8 @@ const trackArtist = document.getElementById("track-artist");
 const tagStyle = document.getElementById("tag-style");
 const tagTempo = document.getElementById("tag-tempo");
 const tagGenre = document.getElementById("tag-genre");
+const tagMatch = document.getElementById("tag-match");
+const tagKey = document.getElementById("tag-key");
 
 const timeCurrent = document.getElementById("time-current");
 const timeTotal = document.getElementById("time-total");
@@ -794,6 +800,20 @@ function updateUI() {
         tagGenre.style.display = "inline-block";
     } else {
         tagGenre.style.display = "none";
+    }
+
+    if (current.match && current.match > 0) {
+        tagMatch.textContent = "Match: " + Math.round(current.match) + "%";
+        tagMatch.style.display = "inline-block";
+    } else {
+        tagMatch.style.display = "none";
+    }
+
+    if (current.key_camelot && current.key_camelot !== "?") {
+        tagKey.textContent = "Tom: " + current.key_camelot;
+        tagKey.style.display = "inline-block";
+    } else {
+        tagKey.style.display = "none";
     }
 
     updatePlayButton();
@@ -1055,6 +1075,36 @@ function renderQueueList() {
     });
 }
 
+function handleNewTrack(newTrack) {
+    if (!newTrack || !newTrack.preview_url) return;
+    const exists = playlist.some(t => t.preview_url === newTrack.preview_url || (t.title === newTrack.title && t.artist === newTrack.artist));
+    if (!exists) {
+        playlist.push(newTrack);
+        renderQueueList();
+        trackPos.textContent = "Faixa " + (currentIndex + 1) + " de " + playlist.length;
+        queueStatus.textContent = playlist.length + " faixas disponíveis";
+    }
+}
+
+if (window.BroadcastChannel) {
+    try {
+        const streamBc = new BroadcastChannel("retail_sound_stream");
+        streamBc.onmessage = (e) => {
+            if (e.data && e.data.type === "ADD_TRACK") {
+                handleNewTrack(e.data.track);
+            }
+        };
+    } catch(err) {
+        console.warn("BroadcastChannel error:", err);
+    }
+}
+
+window.addEventListener("message", (e) => {
+    if (e.data && e.data.type === "ADD_TRACK") {
+        handleNewTrack(e.data.track);
+    }
+});
+
 renderQueueList();
 if (playlist.length > 0) {
     loadDeck(activeDeck, 0);
@@ -1069,7 +1119,7 @@ if (playlist.length > 0) {
 
 
 
-st.set_page_config(page_title="Playlist Studio", page_icon="🎵", layout="centered", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Retail Sound", page_icon="🎵", layout="centered", initial_sidebar_state="collapsed")
 
 # Initialize session state early to prevent KeyError
 if "playlist" not in st.session_state:
@@ -1146,7 +1196,7 @@ st.markdown(
     }
     </style>
     <div class="studio-header">
-        <div class="studio-title">🎵 Playlist <span>Studio</span></div>
+        <div class="studio-title">Retail <span>Sound</span></div>
         <div class="studio-subtitle">Curadoria musical inteligente e transições perfeitas para o seu espaço comercial</div>
     </div>
     """,
@@ -1167,14 +1217,47 @@ feature_labels = {
     "valence": ("Humor & Vibe", "Positividade emocional da música (Sério/Melancólico ↔ Solar/Alegre)"),
     "instrumentalness": ("Instrumental", "Presença de vocais vs. batidas/arranjos instrumentais (Com Vocais ↔ Instrumental)"),
 }
-dataset_means = pd.Series({
-    "energy": 0.636,
-    "acousticness": 0.323,
-    "valence": 0.466,
-    "instrumentalness": 0.183,
-})
+CENTROIDS_PATH = BASE_DIR.parent / "dataset" / "cluster_centroids.csv"
+
+
+@st.cache_data
+def get_dataset_feature_stats(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    m = df[feature_columns].apply(pd.to_numeric, errors="coerce").mean()
+    s = df[feature_columns].apply(pd.to_numeric, errors="coerce").std(ddof=0).replace(0, 1.0)
+    return m, s
+
+
+@st.cache_data
+def load_cluster_centroids() -> pd.DataFrame:
+    if CENTROIDS_PATH.exists():
+        c_df = pd.read_csv(CENTROIDS_PATH)
+        return c_df.sort_values("cluster").reset_index(drop=True)
+    return dataset.groupby("cluster")[feature_columns].mean().reset_index()
+
+
+dataset_means, dataset_stds = get_dataset_feature_stats(dataset)
+centroids_df = load_cluster_centroids()
+centroids_z = (centroids_df[feature_columns].values - dataset_means.values) / dataset_stds.values
+
+# Ambientes e Perfis Acústicos Alvo (incorporando os ambientes do sonora.ipynb: Consultório, Loja, Supermercado)
+environment_targets = {
+    "Consultório": {"energy": 0.12, "acousticness": 0.85, "valence": 0.40, "instrumentalness": 0.90, "tempo": 80, "milliman_dir": "slow"},
+    "Supermercado": {"energy": 0.35, "acousticness": 0.40, "valence": 0.60, "instrumentalness": 0.00, "tempo": 85, "milliman_dir": "slow"},
+    "Loja": {"energy": 0.85, "acousticness": 0.10, "valence": 0.80, "instrumentalness": 0.00, "tempo": 122, "milliman_dir": "fast"},
+    "Restaurante": {"energy": 0.35, "acousticness": 0.65, "valence": 0.50, "instrumentalness": 0.20, "tempo": 95, "milliman_dir": "slow"},
+    "Loja de alto padrão": {"energy": 0.35, "acousticness": 0.60, "valence": 0.45, "instrumentalness": 0.55, "tempo": 100, "milliman_dir": "slow"},
+    "High fashion": {"energy": 0.65, "acousticness": 0.15, "valence": 0.45, "instrumentalness": 0.60, "tempo": 120, "milliman_dir": "fast"},
+    "Relaxante": {"energy": 0.15, "acousticness": 0.85, "valence": 0.35, "instrumentalness": 0.65, "tempo": 75, "milliman_dir": "slow"},
+    "Academia": {"energy": 0.88, "acousticness": 0.08, "valence": 0.65, "instrumentalness": 0.20, "tempo": 130, "milliman_dir": "fast"},
+    "Loja de roupas": {"energy": 0.65, "acousticness": 0.25, "valence": 0.70, "instrumentalness": 0.15, "tempo": 118, "milliman_dir": "fast"},
+    "Shopping": {"energy": 0.60, "acousticness": 0.35, "valence": 0.65, "instrumentalness": 0.15, "tempo": 110, "milliman_dir": "moderate"},
+    "Mercado": {"energy": 0.55, "acousticness": 0.35, "valence": 0.70, "instrumentalness": 0.15, "tempo": 100, "milliman_dir": "slow"},
+}
 
 environment_presets = {
+    "Consultório": {"energy": (0.00, 0.30), "acousticness": (0.60, 1.00), "valence": (0.20, 0.65), "instrumentalness": (0.50, 1.00)},
+    "Supermercado": {"energy": (0.20, 0.55), "acousticness": (0.20, 0.70), "valence": (0.35, 0.85), "instrumentalness": (0.00, 0.30)},
+    "Loja": {"energy": (0.65, 1.00), "acousticness": (0.00, 0.30), "valence": (0.50, 0.95), "instrumentalness": (0.00, 0.30)},
     "Restaurante": {"energy": (0.20, 0.55), "acousticness": (0.35, 1.00), "valence": (0.35, 0.80), "instrumentalness": (0.00, 0.60)},
     "Loja de alto padrão": {"energy": (0.20, 0.60), "acousticness": (0.25, 0.90), "valence": (0.35, 0.75), "instrumentalness": (0.10, 0.85)},
     "High fashion": {"energy": (0.45, 0.85), "acousticness": (0.00, 0.35), "valence": (0.25, 0.70), "instrumentalness": (0.20, 1.00)},
@@ -1186,6 +1269,9 @@ environment_presets = {
 }
 
 environment_popularity_ranges = {
+    "Consultório": (0, 80),
+    "Supermercado": (35, 100),
+    "Loja": (45, 100),
     "Restaurante": (35, 100),
     "Loja de alto padrão": (25, 100),
     "High fashion": (20, 100),
@@ -1197,14 +1283,17 @@ environment_popularity_ranges = {
 }
 
 environment_genre_presets = {
-    "Restaurante": ["acoustic", "jazz", "blues", "piano", "romance", "soul", "r-n-b", "classical", "opera", "brazil", "mpb", "samba", "pagode", "latin", "salsa", "tango", "folk", "guitar", "reggae"],
-    "Loja de alto padrão": ["ambient", "classical", "jazz", "blues", "piano", "acoustic", "deep-house", "electronic", "minimal-techno", "indie", "indie-pop", "synth-pop", "soul", "r-n-b", "trip-hop", "lounge", "chill"],
-    "High fashion": ["electronic", "deep-house", "minimal-techno", "techno", "house", "progressive-house", "synth-pop", "indie", "indie-pop", "pop", "disco", "edm", "electro", "garage", "idm", "breakbeat", "trip-hop", "j-dance", "k-pop"],
-    "Relaxante": ["ambient", "chill", "new-age", "piano", "classical", "acoustic", "romance", "sleep", "study", "folk", "guitar", "singer-songwriter", "jazz", "blues", "opera", "world-music", "dub", "reggae"],
-    "Academia": ["dance", "edm", "house", "deep-house", "electro", "techno", "trance", "drum-and-bass", "hardstyle", "dubstep", "breakbeat", "rock", "hard-rock", "heavy-metal", "metalcore", "punk-rock", "hip-hop", "r-n-b", "funk", "groove", "dancehall", "reggaeton", "afrobeat"],
-    "Loja de roupas": ["pop", "indie-pop", "power-pop", "alternative", "indie", "synth-pop", "dance", "disco", "house", "deep-house", "electronic", "electro", "funk", "groove", "r-n-b", "soul", "hip-hop", "k-pop", "j-pop", "latin", "reggaeton", "afrobeat"],
-    "Shopping": ["pop", "indie-pop", "alternative", "dance", "disco", "house", "deep-house", "edm", "electronic", "latin", "latino", "reggaeton", "salsa", "funk", "groove", "r-n-b", "soul", "k-pop", "j-pop", "afrobeat", "dancehall", "reggae", "rock"],
-    "Mercado": ["pop", "dance", "disco", "house", "latin", "latino", "reggaeton", "brazil", "forro", "samba", "pagode", "mpb", "sertanejo", "reggae", "dancehall", "country", "folk", "rock", "funk", "groove", "soul", "r-n-b", "k-pop"],
+    "Consultório": ["ambient", "classical", "piano", "chill", "acoustic", "jazz", "blues", "guitar", "new-age"],
+    "Supermercado": ["pop", "mpb", "soul", "groove", "disco", "r-n-b", "samba", "pagode", "brazil", "acoustic"],
+    "Loja": ["pop", "dance", "disco", "indie-pop", "synth-pop", "house", "funk", "groove", "r-n-b", "reggaeton"],
+    "Restaurante": ["jazz", "acoustic", "mpb", "soul", "blues", "piano", "brazil", "latin", "chill"],
+    "Loja de alto padrão": ["jazz", "acoustic", "soul", "piano", "chill", "trip-hop", "mpb", "blues", "deep-house"],
+    "High fashion": ["deep-house", "electronic", "minimal-techno", "synth-pop", "trip-hop", "house", "electro", "indie-pop"],
+    "Relaxante": ["ambient", "chill", "piano", "classical", "acoustic", "guitar", "new-age", "world-music"],
+    "Academia": ["dance", "edm", "house", "electro", "hip-hop", "reggaeton", "rock", "techno", "pop"],
+    "Loja de roupas": ["pop", "indie-pop", "synth-pop", "dance", "disco", "deep-house", "house", "groove", "r-n-b", "reggaeton"],
+    "Shopping": ["pop", "indie-pop", "dance", "disco", "groove", "r-n-b", "soul", "mpb", "acoustic"],
+    "Mercado": ["mpb", "samba", "pagode", "brazil", "sertanejo", "pop", "forro", "groove", "acoustic"],
 }
 
 profile_descriptions = {
@@ -1216,21 +1305,12 @@ profile_descriptions = {
 }
 profile_names = {cid: info[0] for cid, info in profile_descriptions.items()}
 
-environment_style_presets = {
-    "Restaurante": ["Acústico & Intimista", "Social & Ensolarado", "Ambiental & Relaxante"],
-    "Loja de alto padrão": ["Acústico & Intimista", "Ambiental & Relaxante", "Eletrônico & Moderno"],
-    "High fashion": ["Eletrônico & Moderno", "Social & Ensolarado"],
-    "Relaxante": ["Ambiental & Relaxante", "Acústico & Intimista"],
-    "Academia": ["Intenso & Dinâmico", "Eletrônico & Moderno", "Social & Ensolarado"],
-    "Loja de roupas": ["Social & Ensolarado", "Eletrônico & Moderno"],
-    "Shopping": ["Social & Ensolarado", "Acústico & Intimista"],
-    "Mercado": ["Social & Ensolarado", "Intenso & Dinâmico"],
-}
 
 def camelot_label(key, mode):
     major = {0: "8B", 1: "3B", 2: "10B", 3: "5B", 4: "12B", 5: "7B", 6: "2B", 7: "9B", 8: "4B", 9: "11B", 10: "6B", 11: "1B"}
     minor = {0: "5A", 1: "12A", 2: "7A", 3: "2A", 4: "9A", 5: "4A", 6: "11A", 7: "6A", 8: "1A", 9: "8A", 10: "3A", 11: "10A"}
     return (major if int(mode) == 1 else minor).get(int(key), "?")
+
 
 def harmonic_distance(previous, candidate):
     pitch_distance = abs(int(previous["key"]) - int(candidate["key"])) % 12
@@ -1238,66 +1318,102 @@ def harmonic_distance(previous, candidate):
     mode_distance = 0 if int(previous["mode"]) == int(candidate["mode"]) else 1
     return pitch_distance + mode_distance * 0.75
 
-def build_playlist(filtered, size, seed):
+
+def build_playlist(filtered: pd.DataFrame, size: int, seed: int) -> pd.DataFrame:
     rng = np.random.default_rng(seed if seed > 0 else None)
     remaining = filtered.copy()
     if remaining.empty:
         return remaining
+
     selected = []
-    first_pool = remaining.nlargest(min(24, len(remaining)), "fit_score")
+    # Primeira faixa sorteada do topo do ranking Sonora
+    first_pool = remaining.nlargest(min(24, len(remaining)), "rank_score")
     selected.append(rng.choice(first_pool.index.to_numpy()))
     remaining = remaining.drop(index=selected[0])
+
     while len(selected) < min(size, len(filtered)) and not remaining.empty:
         previous = filtered.loc[selected[-1]]
-        pool = remaining.nlargest(min(40, len(remaining)), "fit_score").copy()
+        pool = remaining.nlargest(min(40, len(remaining)), "rank_score").copy()
         pool["harmonic_cost"] = pool.apply(
             lambda row, previous=previous: harmonic_distance(previous, row), axis=1
         )
-        pool["tempo_cost"] = (pool["tempo"] - previous["tempo"]).abs() / 40
-        pool["selection_score"] = pool["fit_score"] - pool["harmonic_cost"] * 0.06 - pool["tempo_cost"] * 0.04
+        pool["tempo_cost"] = (pool["tempo"] - previous["tempo"]).abs() / 40.0
+        # Combina o score do motor de 2 estágios com continuidade harmônica e de andamento
+        pool["selection_score"] = pool["rank_score"] - pool["harmonic_cost"] * 0.05 - pool["tempo_cost"] * 0.04
         best_pool = pool.nlargest(min(10, len(pool)), "selection_score")
         next_index = rng.choice(best_pool.index.to_numpy())
         selected.append(next_index)
         remaining = remaining.drop(index=next_index)
+
     result = filtered.loc[selected].copy()
     result["key_camelot"] = [camelot_label(key, mode) for key, mode in zip(result["key"], result["mode"])]
     result["tempo_difference"] = [np.nan, *[(result.iloc[i]["tempo"] - result.iloc[i - 1]["tempo"]) for i in range(1, len(result))]]
     result["estilo_musical"] = result["cluster"].map(profile_names)
+    result["rank_display"] = (result["rank_score"] * 100).round(1)
     return result
+
 
 st.markdown("### 1. Ambiente do seu Espaço")
 selected_environment = st.selectbox(
     "Selecione o Ambiente",
-    list(environment_presets),
+    list(environment_targets),
     label_visibility="collapsed",
     help="Escolha o tipo de ambiente ou proposta do seu espaço.",
 )
 preset_ranges = environment_presets[selected_environment]
+milliman_dir = environment_targets[selected_environment]["milliman_dir"]
+
+# Mapeamento sonoro inteligente para o ambiente
+target_z_env = (np.array([environment_targets[selected_environment][f] for f in feature_columns]) - dataset_means.values) / dataset_stds.values
+cluster_distances_env = np.linalg.norm(centroids_z - target_z_env, axis=1)
+best_cluster_id = int(np.argmin(cluster_distances_env))
+sorted_cluster_ids = np.argsort(cluster_distances_env)
+recommended_styles = [profile_names[c] for c in sorted_cluster_ids[:2]]
+
+st.markdown("### 2. Atmosferas Sonoras")
+st.success(
+    f"✨ **Atmosfera recomendada:** **{profile_names[best_cluster_id]}** — sonoridade ideal para a proposta de **{selected_environment}**."
+)
 
 available_styles = [info[0] for info in profile_descriptions.values()]
 style_to_cluster = {info[0]: cid for cid, info in profile_descriptions.items()}
-recommended_styles = [
-    s for s in environment_style_presets[selected_environment] if s in available_styles
-]
 
-st.markdown("### 2. Atmosferas e Estilos Musicais")
 selected_styles = st.multiselect(
     "Estilos Musicais Selecionados",
     available_styles,
     default=recommended_styles,
     key=f"{selected_environment}_styles",
     label_visibility="collapsed",
-    help="Filtre as atmosferas sonoras desejadas para o seu ambiente.",
+    help="Escolha as atmosferas sonoras para o seu espaço.",
 )
-st.caption("✨ **Estilos sugeridos:** " + ", ".join(recommended_styles))
+st.caption("✨ **Sugestão para este espaço:** " + ", ".join(recommended_styles))
 selected_clusters = [style_to_cluster[s] for s in selected_styles]
 
-with st.expander("ℹ️ Conhecer as 5 Atmosferas Musicais", expanded=False):
+st.markdown("### 3. Ritmo e Andamento")
+milli_info = {
+    "slow": ("🐢 Ritmo Acolhedor (Calmo / Relaxante)", "Músicas em andamento suave convidam o cliente a permanecer mais tempo e circular com tranquilidade pelo espaço."),
+    "fast": ("⚡ Ritmo Estimulante (Dinâmico / Acelerado)", "Batidas com mais energia estimulam o dinamismo, vitalidade e circulação contínua."),
+    "moderate": ("⚖️ Ritmo Equilibrado (Moderado)", "Andamento equilibrado para um fluxo agradável e constante ao longo do dia."),
+}
+milli_badge, milli_help = milli_info[milliman_dir]
+
+col_milli1, col_milli2 = st.columns([3, 2])
+with col_milli1:
+    use_milliman = st.checkbox(
+        "Harmonizar andamento com a proposta do ambiente",
+        value=True,
+        help="Prioriza músicas com andamento (BPM) favorável ao comportamento desejado no espaço.",
+    )
+with col_milli2:
+    st.markdown(f"**Proposta:** {milli_badge}", help=milli_help)
+st.caption(milli_help)
+
+with st.expander("ℹ️ Conhecer as Atmosferas Musicais", expanded=False):
     style_profile_df = pd.DataFrame([
         {
-            "Estilo Musical": name,
-            "Sensação & Características": description,
-            "Recomendado para o Ambiente": "✨ Sim" if name in recommended_styles else "Opcional",
+            "Atmosfera Musical": name,
+            "Sensação & Proposta Sonora": description,
+            "Recomendação": "✨ Sugerido para o espaço" if name in recommended_styles else "Opcional",
         }
         for cid, (name, description) in profile_descriptions.items()
     ])
@@ -1327,7 +1443,7 @@ with st.expander("⚙️ Ajustes de Som e Filtros Avançados (Opcional)", expand
         value=environment_popularity_ranges[selected_environment],
         step=1,
         key=f"{selected_environment}_popularity",
-        help="Ambientes casuais priorizam músicas conhecidas (maior popularidade).",
+        help="Ambientes comerciais equilibram familiaridade com nicho sonoro.",
     )
 
     available_genres = sorted(dataset["track_genre"].dropna().unique())
@@ -1338,7 +1454,7 @@ with st.expander("⚙️ Ajustes de Som e Filtros Avançados (Opcional)", expand
         default=genre_preset,
         key=f"{selected_environment}_genres",
     )
-    st.caption(f"Preset amplo: {len(genre_preset)} gêneros pré-selecionados.")
+    st.caption(f"Preset de gêneros: {len(genre_preset)} sugeridos para este ambiente.")
 
     col_chk1, col_chk2 = st.columns(2)
     with col_chk1:
@@ -1378,6 +1494,8 @@ if "use_all" not in locals():
     use_all = False
 if "random_seed" not in locals():
     random_seed = 0
+if "use_milliman" not in locals():
+    use_milliman = True
 
 filtered_dataset = dataset.copy()
 for column in feature_columns + ["key", "mode", "tempo", "popularity"]:
@@ -1392,25 +1510,49 @@ if selected_genres:
 if avoid_explicit:
     filtered_dataset = filtered_dataset.loc[~filtered_dataset["explicit"].astype(bool)]
 filtered_dataset = filtered_dataset.dropna(subset=feature_columns + ["key", "mode", "tempo", "popularity"])
+
+# ESTÁGIO 1 (Sonora): Ponto-alvo e Aderência Acústica (Exponential Match Score)
 profile_target = {
-    feature: sum(bounds) / 2
-    for feature, bounds in feature_ranges.items()
-}
-environment_target = pd.Series({
-    feature: 0.65 * profile_target[feature] + 0.35 * dataset_means[feature]
+    feature: (feature_ranges[feature][0] + feature_ranges[feature][1]) / 2.0
     for feature in feature_columns
-})
-distance_to_target = filtered_dataset[feature_columns].sub(environment_target, axis="columns").abs().mean(axis=1)
-range_width = pd.Series({
-    feature: max(maximum - minimum, 0.20)
-    for feature, (minimum, maximum) in feature_ranges.items()
-})
-outside_preference = pd.DataFrame({
-    feature: (filtered_dataset[feature] - maximum).clip(lower=0)
-    + (minimum - filtered_dataset[feature]).clip(lower=0)
-    for feature, (minimum, maximum) in feature_ranges.items()
-}).div(range_width).mean(axis=1)
-filtered_dataset["fit_score"] = 1 - (distance_to_target * 0.75 + outside_preference * 0.25)
+}
+tz_active = np.array([(profile_target[f] - dataset_means[f]) / dataset_stds[f] for f in feature_columns])
+
+if not filtered_dataset.empty:
+    Z_tracks = (filtered_dataset[feature_columns].values - dataset_means.values) / dataset_stds.values
+    dt = np.linalg.norm(Z_tracks - tz_active, axis=1)
+    # Aderência calibrada com decaimento exponencial tau=2.2 (Sonora)
+    filtered_dataset["match"] = np.round(np.exp(-dt / 2.2) * 100, 1)
+
+    # ESTÁGIO 2 (Sonora): Regra comportamental de Milliman (1982) por andamento
+    slow_func = lambda t: np.clip((110.0 - t) / 60.0, 0.0, 1.0)
+    fast_func = lambda t: np.clip((t - 100.0) / 60.0, 0.0, 1.0)
+    mod_func = lambda t: np.clip(1.0 - np.abs(t - 105.0) / 40.0, 0.0, 1.0)
+
+    if milliman_dir == "slow":
+        beh = slow_func(filtered_dataset["tempo"].values)
+    elif milliman_dir == "fast":
+        beh = fast_func(filtered_dataset["tempo"].values)
+    else:
+        beh = mod_func(filtered_dataset["tempo"].values)
+
+    if use_milliman:
+        filtered_dataset["milliman_score"] = np.round(beh * 100, 1)
+        filtered_dataset["rank_score"] = (
+            0.5 * (filtered_dataset["match"] / 100.0) +
+            0.3 * (filtered_dataset["popularity"] / 100.0) +
+            0.2 * beh
+        )
+    else:
+        filtered_dataset["milliman_score"] = 0.0
+        filtered_dataset["rank_score"] = (
+            0.6 * (filtered_dataset["match"] / 100.0) +
+            0.4 * (filtered_dataset["popularity"] / 100.0)
+        )
+else:
+    filtered_dataset["match"] = []
+    filtered_dataset["milliman_score"] = []
+    filtered_dataset["rank_score"] = []
 
 st.markdown("---")
 playlist_size = st.slider("Tamanho da Playlist (músicas)", 5, 50, 20)
@@ -1477,17 +1619,21 @@ if st.session_state.get("playlist") is not None:
             "artists",
             "track_genre",
             "estilo_musical",
+            "match",
             "popularity",
             "tempo",
+            "key_camelot",
             *feature_columns,
         ]
         display_rename = {
             "track_name": "Música",
             "artists": "Artista",
             "track_genre": "Gênero",
-            "estilo_musical": "Estilo Musical",
+            "estilo_musical": "Atmosfera",
+            "match": "Aderência (% Match)",
             "popularity": "Popularidade",
             "tempo": "BPM (Andamento)",
+            "key_camelot": "Tom Harmônico",
             "energy": "Energia",
             "acousticness": "Acústico",
             "valence": "Humor (Valence)",

@@ -7,7 +7,10 @@ repo_name = "r.ia-spotify_nano_challenge"
 # edit_uri = "edit/main/docs/"
 
 nav = [
+  { "Início" = "index.md" },
   { "1. Limpeza de Dados" = "1_data_cleaning/limpeza.md" },
+  { "2. Agrupamento (Clustering)" = "2_clustering/clustering.md" },
+  { "3. Aplicação Retail Sound" = "3_aplicacao/aplicacao.md" },
 ]
 
 # extra_css = ["stylesheets/extra.css"]
