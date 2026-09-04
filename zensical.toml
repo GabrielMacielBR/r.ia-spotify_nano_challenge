@@ -8,13 +8,23 @@ repo_name = "r.ia-spotify_nano_challenge"
 
 nav = [
   { "Início" = "index.md" },
+  { "Guiding Questions" = "0_guiding_questions/guiding_questions.md" },
   { "1. Limpeza de Dados" = "1_data_cleaning/limpeza.md" },
   { "2. Agrupamento (Clustering)" = "2_clustering/clustering.md" },
   { "3. Aplicação Retail Sound" = "3_aplicacao/aplicacao.md" },
+  { "4. Apresentação Final" = "4_apresentacao/apresentacao.md" },
 ]
 
-# extra_css = ["stylesheets/extra.css"]
-# extra_javascript = ["javascripts/extra.js"]
+extra_css = [
+  "https://cdn.jsdelivr.net/npm/glightbox/dist/css/glightbox.min.css",
+]
+
+extra_javascript = [
+  "javascripts/mathjax.js",
+  "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js",
+  "https://cdn.jsdelivr.net/npm/glightbox/dist/js/glightbox.min.js",
+  "javascripts/zoom.js",
+]
 
 [project.theme]
 # variant = "classic"
@@ -114,3 +124,4 @@ pymdownx.tabbed.alternate_style = true
 pymdownx.tabbed.combine_header_slug = true
 pymdownx.tasklist.custom_checkbox = true
 pymdownx.tilde = {}
+"zensical.extensions.glightbox" = {}

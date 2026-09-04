@@ -76,9 +76,11 @@ O desenvolvimento analítico e os experimentos de inteligência artificial estã
 
 Acesse a documentação detalhada nos arquivos markdown ou via [GitHub Pages](https://gabrielmacielbr.github.io/r.ia-spotify_nano_challenge/):
 
-1. [**1. Limpeza de Dados**](docs/1_data_cleaning/limpeza.md): Métricas do funil de higienização, justificativas técnicas e distribuição acústica.
-2. [**2. Agrupamento (Clustering)**](docs/2_clustering/clustering.md): Metodologia K-Means, centróides dos 5 perfis e projeção visual PCA.
-3. [**3. Aplicação Retail Sound**](docs/3_aplicacao/aplicacao.md): Arquitetura do motor em dois estágios, regra de Milliman, player com streaming progressivo e guia operacional.
+1. [**Guiding Questions**](docs/0_guiding_questions/guiding_questions.md): Questões norteadoras fundamentais (v1 e v2.0), taxonomia das variáveis, curva da festa e princípios de transição do DJ.
+2. [**1. Limpeza de Dados**](docs/1_data_cleaning/limpeza.md): Métricas do funil de higienização, justificativas técnicas e distribuição acústica.
+3. [**2. Agrupamento (Clustering)**](docs/2_clustering/clustering.md): Metodologia K-Means, centróides dos 5 perfis e projeção visual PCA.
+4. [**3. Aplicação Retail Sound**](docs/3_aplicacao/aplicacao.md): Arquitetura do motor em dois estágios, regra de Milliman, player com streaming progressivo e guia operacional.
+5. [**4. Apresentação Final**](docs/4_apresentacao/apresentacao.md): Slides da apresentação executiva em PDF incorporado, capturas de tela com zoom e síntese da proposta de valor.
 
 ---
 

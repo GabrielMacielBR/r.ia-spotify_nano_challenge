@@ -52,7 +52,23 @@ Para oferecer uma experiência de audição fluida e sem esperas, a aplicação 
 
 ---
 
-## 3. Como Executar a Aplicação
+## 3. Capturas de Tela da Aplicação
+
+*(Clique em qualquer imagem para ampliar em tela cheia com zoom interativo)*
+
+### A. Painel Principal de Curadoria Sonora
+A interface centralizada do **Retail Sound** permite ao curador ou lojista selecionar o ambiente desejado (ex.: **Academia**), carregando instantaneamente as atmosferas recomendadas (*Social & Ensolarado* e *Intenso & Dinâmico*), a modulação rítmica de Milliman (1982) e as tabelas com as descrições dos estilos musicais:
+
+![Painel de Curadoria e Parâmetros Sonoros — Retail Sound](./assets/retail_sound_interface.png)
+
+### B. Reprodutor de Áudio com Equal-Power Crossfade
+O reprodutor integrado busca as prévias de 30 segundos via API externa e executa transições contínuas sem cortes bruscos. No exemplo abaixo, a música *Just the Two of Us* é executada com tags contextuais em tempo real (`Match: 72%`, `Tom: 3A`, `95 BPM`, `Estilo: Acústico & Intimista`), botão de alternância de crossfade e fila dinâmica de reprodução:
+
+![Player de Áudio com Equal-Power Crossfade — Retail Sound](./assets/retail_sound_player_crossfade.png)
+
+---
+
+## 4. Como Executar a Aplicação
 
 ### Pré-requisitos
 - **Python 3.10 ou superior** instalado no sistema.
@@ -104,10 +120,11 @@ A aplicação será iniciada e abrirá automaticamente no navegador em `http://l
 
 ---
 
-## 4. Uso da Interface
+## 5. Uso da Interface
 
-1. **Escolha do Ponto Comercial**: Na barra lateral, selecione o ambiente que deseja sonorizar (ex.: *Supermercado*, *Café*, *Academia*, *Livraria*).
-2. **Modulação de Andamento**: Ative ou ajuste a modulação de BPM com base no objetivo comercial (relaxamento/permanência versus rotação/energia).
-3. **Geração e Audição**: Clique para gerar a grade de programação. O player inteligente iniciará automaticamente na primeira faixa disponível.
-4. **Exportação**: Baixe a lista gerada em formato CSV ou execute consultas SQL personalizadas diretamente sobre o banco SQLite integrado.
+1. **Escolha do Ponto Comercial**: Selecione o ambiente comercial que deseja sonorizar (ex.: *Restaurante*, *Loja de alto padrão*, *Academia*, *Mercado*).
+2. **Atmosferas e Estilos Sonoros**: Selecione os perfis sonoros sugeridos para compor a atmosfera desejada.
+3. **Ajustes Finos e Filtros (Opcional)**: No sanfonado de parâmetros, ajuste as 4 dimensões de áudio, faixa de popularidade, gêneros e filtro de conteúdo explícito.
+4. **Geração e Audição**: Escolha o tamanho da playlist (5 a 50 faixas) e clique em **Gerar Playlist**. O player inteligente iniciará automaticamente na primeira faixa disponível com efeito de crossfade.
+5. **Exportação**: Baixe a lista gerada em formato CSV ou os previews em arquivo ZIP, ou realize consultas SQL customizadas diretamente sobre o banco SQLite integrado.
 
